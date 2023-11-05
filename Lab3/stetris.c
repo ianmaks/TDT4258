@@ -25,11 +25,13 @@
 // the game logic allocate/deallocate and reset the memory
 typedef struct {
   bool occupied;
+  int color;
 } tile;
 
 typedef struct {
   unsigned int x;
   unsigned int y;
+  int color;
 } coord;
 
 typedef struct {
@@ -54,11 +56,15 @@ typedef struct {
                               // lowers with increasing level, never reaches 0
 } gameConfig;
 
+int colors[6] = {0xf800, 0xffe0, 0x07e0, 0x001f, 0xf81f, 0x07ff};
+
 u_int16_t framebufferfd;
 u_int16_t* framebuffer;
 u_int32_t joystickfd;
 struct input_event event;
 
+coord active_tile;
+int c;
 
 gameConfig game = {
                    .grid = {8, 8},
@@ -75,29 +81,30 @@ bool initializeSenseHat() {
   struct fb_var_screeninfo vinfo;
   struct fb_fix_screeninfo finfo;
   int i = 0;
-  while(true) {
-    if (i>1) {
-      break;
-    }
-      // framebufferlocation = "/dev/fb%c" i;
-      printf("/dev/fb%i\n", i);
+  char framebufferlocation[9] = "/dev/fb0";
 
-      framebufferfd = open("/dev/fb%i", i, O_RDWR);
-      if (framebufferfd < 0) {
-        int errsv = errno;
-        fprintf(stderr, "ERROR: could not open framebuffer\n");
-        fprintf(stderr, "ERROR: %s\n", strerror(errsv));
-        return false;
-      }
-      ioctl(framebufferfd, FBIOGET_FSCREENINFO, &finfo);
-      ioctl(framebufferfd, FBIOGET_VSCREENINFO, &vinfo);
-      for (int j = 0; j < 15; j++) {
-        printf("%c", finfo.id[j]);
-      }
-      printf("\n");
-      if (finfo.id == "RPi-Sense FB") break;
-      i += 1;
+  while(true) {
+    /// Creates a correct file path to the file descriptor
+    sprintf(framebufferlocation+7, "%d", i);
+    strcpy(framebufferlocation+8, "\0");
+    // framebufferlocation[7] = (char) i;
+    printf("%s\n", framebufferlocation);
+    framebufferfd = open(framebufferlocation, O_RDWR);
+    if (framebufferfd < 0) {
+      int errsv = errno;
+      fprintf(stderr, "ERROR: could not open framebuffer\n");
+      fprintf(stderr, "ERROR: %s\n", strerror(errsv));
+      return false;
+    }
+    ioctl(framebufferfd, FBIOGET_FSCREENINFO, &finfo);
+    ioctl(framebufferfd, FBIOGET_VSCREENINFO, &vinfo);
+    printf("%s\n", finfo.id);
+
+    if (strcmp(finfo.id, "RPi-Sense FB") == 0) break;
+    i += 1;
   }
+
+  /// When correct file descriptor is found, map the framebuffer to memory
   framebuffer = mmap(NULL, 128, PROT_READ | PROT_WRITE, MAP_SHARED, framebufferfd, 0);
       if (framebuffer == MAP_FAILED) {
         int errsv = errno;
@@ -105,17 +112,12 @@ bool initializeSenseHat() {
         fprintf(stderr, "ERROR: %s\n", strerror(errsv));
         return false;
       }
-
-
-  
-
+  /// Open the file descriptor for the joystick
   joystickfd = open("/dev/input/event0", O_RDONLY);
   if (joystickfd < 0) {
     fprintf(stderr, "ERROR: could not open input device\n");
     return false;
   }
-
-
   return true;
 }
 
@@ -124,17 +126,15 @@ bool initializeSenseHat() {
 void freeSenseHat() {
   munmap(framebuffer, 128);
   close(framebufferfd);
-
 }
 
-// This function should return the key that corresponds to the joystick press
-// KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, with the respective direction
-// and KEY_ENTER, when the the joystick is pressed
-// !!! when nothing was pressed you MUST return 0 !!!
-int readSenseHatJoystick() {
-  int ret = read(joystickfd, &event, sizeof(event));
+int handleJoystickInput(int joystickfd) {
+  read(joystickfd, &event, sizeof(event));
+
   int key = 0;
-  if (event.type == EV_KEY && event.value == 1) {
+  
+/// Checks if the joystick was moved from center to any direction, or held in any direction, ignores if the joystick is released to center
+  if (event.type == EV_KEY && (event.value == 1 || event.value == 2)) {
     switch (event.code) {
       case KEY_UP:
         key = KEY_UP;
@@ -150,9 +150,27 @@ int readSenseHatJoystick() {
       case KEY_ENTER:
         key = KEY_ENTER;
         break;
+      default:
+        key = KEY_DOWN;
     }
   }
   return key;
+}
+
+// This function should return the key that corresponds to the joystick press
+// KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, with the respective direction
+// and KEY_ENTER, when the the joystick is pressed
+// !!! when nothing was pressed you MUST return 0 !!!
+/// This function polls the joystick, and only reads the input if there is any
+int readSenseHatJoystick() {
+  struct pollfd eventpoll = {
+      .events = POLLIN,
+      .fd = joystickfd
+    };
+  if (poll(&eventpoll, 1, 0) > 0){
+    return handleJoystickInput(eventpoll.fd);
+  }
+  return 0;
 }
 
 
@@ -161,26 +179,40 @@ int readSenseHatJoystick() {
 // has changed the playfield
 void renderSenseHatMatrix(bool const playfieldChanged) {
   (void) playfieldChanged;
+  if (!playfieldChanged)
+    return;
+
+
+  /// This is the code that renders the playfield to the LED matrix
+  /// The code could be optimized by passing only the changed tiles 
   for (int i = 0; i < 64; i++) {
-    if (game.playfield[i/8][i%8].occupied == true) {
-      framebuffer[i] = 0xFFFF;
-    }
-    else {
-      framebuffer[i] = 0xFFFF;
-    }
+      framebuffer[i] = game.playfield[i/8][i%8].color;
   }
-
-
 }
 
+void resetMatrix() {
+  for (int i = 0; i < 64; i++) {
+    framebuffer[i] = 0x0000;
+  }
+}
 // The game logic uses only the following functions to interact with the playfield.
 // if you choose to change the playfield or the tile structure, you might need to
 // adjust this game logic <> playfield interface
 
 static inline void newTile(coord const target) {
   game.playfield[target.y][target.x].occupied = true;
+  c = rand() % 7;
+  
+  /// Each playfield location gets a color assigned to it
+  game.playfield[target.y][target.x].color = colors[c];
+
+
+  // printf("%d\n", c);
+  // game.activeTile.color = 0xFFFF;
+
 }
 
+// Entire tile, including color data is copied
 static inline void copyTile(coord const to, coord const from) {
   memcpy((void *) &game.playfield[to.y][to.x], (void *) &game.playfield[from.y][from.x], sizeof(tile));
 }
@@ -316,6 +348,7 @@ bool sTetris(int const key) {
     // Move the current tile
     if (key) {
       playfieldChanged = true;
+      active_tile = game.activeTile;
       switch(key) {
       case KEY_LEFT:
         moveLeft();
@@ -382,7 +415,7 @@ bool sTetris(int const key) {
 //   int lkey = 0;
 
 //   if (poll(&pollStdin, 1, 0)) {
-//     lkey = fgetc(stdin);
+    // lkey = fgetc(stdin);
 //     if (lkey != 27)
 //       goto exit;
 //     lkey = fgetc(stdin);
@@ -511,7 +544,7 @@ int main(int argc, char **argv) {
     }
     game.tick = (game.tick + 1) % game.nextGameTick;
   }
-
+  resetMatrix();
   freeSenseHat();
   free(game.playfield);
   free(game.rawPlayfield);
